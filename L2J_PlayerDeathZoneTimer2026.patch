@@ -1,0 +1,303 @@
+### Eclipse Workspace Patch 1.0
+#P L2J_Mobius_14.1_SamuraiCrow
+diff --git dist/game/data/scripts/custom/PlayerDeathZoneTimer/PlayerDeathZoneTimer.java dist/game/data/scripts/custom/PlayerDeathZoneTimer/PlayerDeathZoneTimer.java
+new file mode 100644
+index 0000000..7e6c6cb
+--- /dev/null
++++ dist/game/data/scripts/custom/PlayerDeathZoneTimer/PlayerDeathZoneTimer.java
+@@ -0,0 +1,294 @@
++/*
++ * Copyright (c) 2013 L2jMobius
++ * 
++ * Permission is hereby granted, free of charge, to any person obtaining a copy
++ * of this software and associated documentation files (the "Software"), to deal
++ * in the Software without restriction, including without limitation the rights
++ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++ * copies of the Software, and to permit persons to whom the Software is
++ * furnished to do so, subject to the following conditions:
++ * 
++ * The above copyright notice and this permission notice shall be
++ * included in all copies or substantial portions of the Software.
++ * 
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
++ * WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
++ * IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
++ */
++package custom.PlayerDeathZoneTimer;
++
++import java.util.Set;
++import java.util.concurrent.ConcurrentHashMap;
++
++import org.l2jmobius.commons.network.buffer.WriteBuffer;
++import org.l2jmobius.commons.threads.ThreadPool;
++import org.l2jmobius.gameserver.entity.actor.Creature;
++import org.l2jmobius.gameserver.entity.actor.Player;
++import org.l2jmobius.gameserver.entity.zone.ZoneId;
++import org.l2jmobius.gameserver.entity.zone.ZoneType;
++import org.l2jmobius.gameserver.managers.ZoneManager;
++import org.l2jmobius.gameserver.mechanics.events.EventType;
++import org.l2jmobius.gameserver.mechanics.events.ListenerRegisterType;
++import org.l2jmobius.gameserver.mechanics.events.annotations.RegisterEvent;
++import org.l2jmobius.gameserver.mechanics.events.annotations.RegisterType;
++import org.l2jmobius.gameserver.mechanics.events.holders.actor.creature.OnCreatureDeath;
++import org.l2jmobius.gameserver.mechanics.events.holders.actor.creature.OnCreatureTeleported;
++import org.l2jmobius.gameserver.mechanics.events.holders.actor.player.OnPlayerLogin;
++import org.l2jmobius.gameserver.mechanics.events.holders.actor.player.OnPlayerLogout;
++import org.l2jmobius.gameserver.mechanics.script.Script;
++import org.l2jmobius.gameserver.network.GameClient;
++import org.l2jmobius.gameserver.network.ServerPackets;
++import org.l2jmobius.gameserver.network.serverpackets.ServerPacket;
++import org.l2jmobius.gameserver.network.serverpackets.huntingzones.TimedHuntingZoneExit;
++
++/**
++ * PLAYER DEATH ZONE TIMER & UI SYNC (Unified Retail-Like Engine)
++ * 
++ * PURPOSE & OFFICIAL RETAIL MECHANICS:
++ * In official Lineage 2, upon dying anywhere on the map, the native client displays a countdown
++ * graphical user interface (UI) before the character is forcibly returned to the village:
++ * - Boss Zones / Raid Lairs: 10 minutes (600 seconds).
++ * - Siege & Castle Zones: 10 minutes (600 seconds).
++ * - Common Field (Open World): 60 minutes (3600 seconds).
++ * 
++ * HIGH-PERFORMANCE UNIFIED ARCHITECTURE:
++ * 1. Exclusive Player Filter (GLOBAL_PLAYERS):
++ *    - The ON_CREATURE_DEATH event is registered solely for players. Thousands of farming monster
++ *      deaths per minute are completely ignored by the Core without invoking this script.
++ * 2. Network Spam Prevention on Teleport:
++ *    - The ON_CREATURE_TELEPORTED event only sends UI cleanup packets if the player was actually
++ *      in the active dead players list.
++ * 3. Universal Resurrection Cleanup:
++ *    - An ultra-lightweight periodic thread (1 second) analyzes only the fallen players list.
++ *      If a player is resurrected on the spot (in Boss, Siege, or Field by Bishop/Scroll),
++ *      the death UI closes immediately on screen.
++ * 4. Memory Leak Prevention:
++ *    - Disconnections of dead players remove references via ON_PLAYER_LOGOUT and during thread execution,
++ *      with state restored automatically on ON_PLAYER_LOGIN if the player reconnects while dead.
++ * 5. Automatic Native Exceptions:
++ *    - Ignores closed instances (which have dedicated timers and mechanics).
++ *    - Ignores Peace Zones and Towns (Peace / Arenas).
++ *    - Ignores Timed Hunting Zones (handled natively by the Core).
++ */
++
++/**
++ * PlayerDeathZoneTimer AI - 25 06 2026
++ * @author Notorion
++ */
++public class PlayerDeathZoneTimer extends Script
++{
++	// Official Field Duration: 60 Minutes (3600 seconds)
++	private static final int FIELD_TIMER_DURATION = 3600;
++	// Official Boss Zone Duration: 10 Minutes (600 seconds)
++	private static final int BOSS_TIMER_DURATION = 600;
++	// Official Siege / Castle Duration: 10 Minutes (600 seconds)
++	private static final int SIEGE_TIMER_DURATION = 600;
++	
++	// All Raid and Grand Boss zone IDs
++	private static final int[] BOSS_ZONES_IDS =
++	{
++		12003,
++		12005,
++		888890,
++		888891,
++		888892,
++		888893,
++		888894,
++		221800,
++		200007,
++		200008,
++		200009
++	};
++	
++	// Concurrent set holding currently dead players
++	private static final Set<Player> DEAD_PLAYERS = ConcurrentHashMap.newKeySet();
++	
++	public PlayerDeathZoneTimer()
++	{
++		// Register physical exit trigger for Boss Zones
++		addExitZoneId(BOSS_ZONES_IDS);
++		
++		// Runs every 1 second over the active dead players list only
++		ThreadPool.scheduleAtFixedRate(() ->
++		{
++			for (Player player : DEAD_PLAYERS)
++			{
++				if ((player == null) || !player.isOnline())
++				{
++					// Remove disconnected player
++					DEAD_PLAYERS.remove(player);
++				}
++				else if (!player.isDead())
++				{
++					// Player resurrected on the spot (e.g. Bishop, Blessed Scroll, etc.)
++					// Close death timer UI immediately and remove from dead list
++					player.sendPacket(new ExFieldDieLimtTime(0));
++					player.sendPacket(new TimedHuntingZoneExit(0));
++					DEAD_PLAYERS.remove(player);
++				}
++			}
++		}, 1000, 1000);
++	}
++	
++	/**
++	 * Triggered automatically as soon as any PLAYER dies on the server. Registered as GLOBAL_PLAYERS to never trigger on farm monster deaths.
++	 * @param event creature death event
++	 */
++	@RegisterEvent(EventType.ON_CREATURE_DEATH)
++	@RegisterType(ListenerRegisterType.GLOBAL_PLAYERS)
++	public void onCreatureDeath(OnCreatureDeath event)
++	{
++		final Creature target = event.getTarget();
++		if ((target != null) && target.isPlayer())
++		{
++			applyDeathTimer(target.asPlayer());
++		}
++	}
++	
++	/**
++	 * Analyzes the location where the player died and dispatches the corresponding official timer.
++	 * @param player the player who just died
++	 */
++	private void applyDeathTimer(Player player)
++	{
++		// RULE 1: Ignore if inside an Instance (closed dungeons have their own mechanics)
++		if (player.getInstanceWorld() != null)
++		{
++			return;
++		}
++		
++		// RULE 2: Ignore official Timed Hunting Zones (handled natively with core timers)
++		if (player.isInsideZone(ZoneId.TIMED_HUNTING))
++		{
++			return;
++		}
++		
++		// RULE 3: Ignore Peace Zones and Towns
++		if (player.isInsideZone(ZoneId.PEACE))
++		{
++			return;
++		}
++		
++		// RULE 4: Raid & Grand Boss Zones apply the official 10-minute timer (600s)
++		for (int bossZoneId : BOSS_ZONES_IDS)
++		{
++			final ZoneType bossZone = ZoneManager.getInstance().getZoneById(bossZoneId);
++			if ((bossZone != null) && bossZone.isInsideZone(player))
++			{
++				player.sendPacket(new ExFieldDieLimtTime(BOSS_TIMER_DURATION));
++				DEAD_PLAYERS.add(player);
++				return;
++			}
++		}
++		
++		// RULE 5: Siege and Castle Zones apply the official 10-minute timer (600s)
++		if (player.isInsideZone(ZoneId.SIEGE) || player.isInsideZone(ZoneId.CASTLE))
++		{
++			player.sendPacket(new ExFieldDieLimtTime(SIEGE_TIMER_DURATION));
++			DEAD_PLAYERS.add(player);
++			return;
++		}
++		
++		// RULE 6: Open Field death: activates the official 60-minute countdown (3600s)
++		player.sendPacket(new ExFieldDieLimtTime(FIELD_TIMER_DURATION));
++		DEAD_PLAYERS.add(player);
++	}
++	
++	/**
++	 * Triggered when a player finishes teleport loading (e.g. To Village). Optimized: Only sends cleanup packets if the player was actually in the dead list!
++	 * @param event creature teleported event
++	 */
++	@RegisterEvent(EventType.ON_CREATURE_TELEPORTED)
++	@RegisterType(ListenerRegisterType.GLOBAL_PLAYERS)
++	public void onCreatureTeleported(OnCreatureTeleported event)
++	{
++		final Creature target = event.getCreature();
++		if ((target != null) && target.isPlayer())
++		{
++			final Player player = target.asPlayer();
++			if (DEAD_PLAYERS.remove(player))
++			{
++				player.sendPacket(new ExFieldDieLimtTime(0));
++				player.sendPacket(new TimedHuntingZoneExit(0));
++			}
++		}
++	}
++	
++	/**
++	 * Triggered when a player logs into the game. If reconnecting while dead, reapplies the UI.
++	 * @param event player login event
++	 */
++	@RegisterEvent(EventType.ON_PLAYER_LOGIN)
++	@RegisterType(ListenerRegisterType.GLOBAL_PLAYERS)
++	public void onPlayerLogin(OnPlayerLogin event)
++	{
++		final Player player = event.getPlayer();
++		if ((player != null) && player.isDead())
++		{
++			applyDeathTimer(player);
++		}
++	}
++	
++	/**
++	 * Triggered when a player logs out of the game. Removes the reference to prevent memory leaks.
++	 * @param event player logout event
++	 */
++	@RegisterEvent(EventType.ON_PLAYER_LOGOUT)
++	@RegisterType(ListenerRegisterType.GLOBAL_PLAYERS)
++	public void onPlayerLogout(OnPlayerLogout event)
++	{
++		final Player player = event.getPlayer();
++		if (player != null)
++		{
++			DEAD_PLAYERS.remove(player);
++		}
++	}
++	
++	/**
++	 * Triggered when a creature physically exits a monitored zone (e.g. Boss Zone). Ensures cleanup if the player was resurrected and walked out of the zone without teleporting.
++	 * @param creature the creature exiting the zone
++	 * @param zone the zone being exited
++	 */
++	@Override
++	public void onExitZone(Creature creature, ZoneType zone)
++	{
++		if (creature.isPlayer())
++		{
++			final Player player = creature.asPlayer();
++			if (DEAD_PLAYERS.remove(player))
++			{
++				player.sendPacket(new ExFieldDieLimtTime(0));
++				player.sendPacket(new TimedHuntingZoneExit(zone.getId()));
++			}
++		}
++		super.onExitZone(creature, zone);
++	}
++	
++	/**
++	 * CUSTOM PACKET (Inner Class) Sends the EX_FIELD_DIE_LIMT_TIME opcode with the specified seconds. Sending 0 instructs the game client to close and hide the countdown window.
++	 */
++	private static class ExFieldDieLimtTime extends ServerPacket
++	{
++		private final int _seconds;
++		
++		public ExFieldDieLimtTime(int seconds)
++		{
++			_seconds = seconds;
++		}
++		
++		@Override
++		public void writeImpl(GameClient client, WriteBuffer buffer)
++		{
++			ServerPackets.EX_FIELD_DIE_LIMT_TIME.writeId(this, buffer);
++			buffer.writeInt(_seconds);
++		}
++	}
++	
++	public static void main(String[] args)
++	{
++		new PlayerDeathZoneTimer();
++	}
++}
+\ No newline at end of file
